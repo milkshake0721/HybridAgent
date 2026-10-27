@@ -60,6 +60,8 @@ def parse_args(argv=None) -> HybridRLConfig:
     p.add_argument("--min_latent_steps", type=int, default=None, help="per latent span; default per task")
     p.add_argument("--max_latent_steps", type=int, default=None, help="per latent span; default per task")
     p.add_argument("--search_result_length", type=int, default=None, help="chars per snippet; default per task")
+    p.add_argument("--freeze_experts", action="store_true", help="freeze MoE routed experts (.experts.) during RL")
+    p.add_argument("--use_8bit", action="store_true", help="use 8-bit PagedAdamW in ZeroOneAdamW")
     p.add_argument("--wandb", action="store_true")
     args = p.parse_args(argv)
     preset = TASK_PRESETS[args.task]
@@ -128,13 +130,13 @@ def main(argv=None) -> None:
     prompts = load_prompts(resolve_data_path(cfg.data), cfg.ability)
     log(f"prompts={len(prompts)}")
 
-    model, tokenizer = load_policy(cfg.model, device)
+    model, tokenizer = load_policy(cfg.model, device, freeze_experts=cfg.freeze_experts)
     tools = build_tool_executor(PYTHON_TIMEOUT, SEARCH_MAX_RESULTS, cfg.search_result_length, require_search=True)
     trainable = [p for p in model.backbone.parameters() if p.requires_grad]
     log(f"trainable backbone parameters: {sum(p.numel() for p in trainable) / 1e9:.3f}B; HybridLink frozen")
     optimizer = ZeroOneAdamW(
         [{"params": trainable, "lr": cfg.lr}], rank=rank, world_size=world,
-        betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY,
+        betas=ADAM_BETAS, eps=ADAM_EPS, weight_decay=WEIGHT_DECAY, use_8bit=cfg.use_8bit,
     )
     log("  " + optimizer.state_summary())
 

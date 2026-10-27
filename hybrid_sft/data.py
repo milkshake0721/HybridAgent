@@ -22,6 +22,7 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from hybrid_agent.constants import ENTRY_ANCHOR, EXIT_ANCHOR
+from hybrid_agent.model import ensure_chat_template
 from hybrid_agent.prompts import SYSTEM_PROMPT
 
 EXIT_ANCHOR_CE_WEIGHT = 2.0
@@ -50,6 +51,7 @@ def _build_chat_messages(system: str, question: str) -> list[dict]:
 
 def build_prompt(tokenizer: PreTrainedTokenizerBase, system: str, question: str) -> str | None:
     """Generation prompt from the chat template; None if the template is unusable."""
+    ensure_chat_template(tokenizer)
     try:
         prompt = tokenizer.apply_chat_template(
             _build_chat_messages(system, question), add_generation_prompt=True, tokenize=False,
@@ -58,8 +60,9 @@ def build_prompt(tokenizer: PreTrainedTokenizerBase, system: str, question: str)
         return None
     if not isinstance(prompt, str):
         return None
-    # The template either prefills "<think>\n" or ends at the assistant header.
-    if prompt.endswith(THINK_PREFILL) or prompt.endswith("assistant\n"):
+    # The template either prefills "<think>\n" or ends at the assistant/model header.
+    valid_endings = (THINK_PREFILL, "assistant\n", "<start_of_turn>model\n", "model\n", "<channel|>")
+    if any(prompt.endswith(ending) for ending in valid_endings):
         return prompt
     return None
 

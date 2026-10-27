@@ -19,7 +19,7 @@ _SEGMENT_RE = re.compile(
     re.DOTALL,
 )
 
-_EOS_RE = re.compile(r"(?:<\|endoftext\|>|<\|im_end\|>)\s*$")
+_EOS_RE = re.compile(r"(?:<\|endoftext\|>|<\|im_end\|>|<turn\|>|<end_of_turn>|<eos>)\s*$")
 
 GENERATION_DEFAULTS = dict(
     max_response_tokens=4096,

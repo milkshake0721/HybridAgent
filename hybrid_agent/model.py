@@ -6,19 +6,54 @@ Shared by HybridSFT, HybridRL and inference.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
+from unittest import mock
 
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .constants import ANCHOR_TOKENS
+from .constants import ANCHOR_TOKENS, THINK_CLOSE, THINK_OPEN
 from .hybridlink import HYBRIDLINK_CONFIG, HybridLink
 
 HYBRIDLINK_WEIGHTS = "adapter.pt"
 HYBRIDLINK_CONFIG_FILE = "adapter_config.json"
+
+DEFAULT_GEMMA4_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{% if message['role'] == 'system' %}<|turn>system\n{{ message['content'] }}<turn|>\n"
+    "{% elif message['role'] == 'user' %}<|turn>user\n{{ message['content'] }}<turn|>\n"
+    "{% elif message['role'] == 'assistant' %}<|turn>model\n{{ message['content'] }}<turn|>\n"
+    "{% endif %}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}<|turn>model\n<think>\n{% endif %}"
+)
+
+
+def ensure_chat_template(tokenizer) -> None:
+    """Assign a default chat template when a base model (e.g. Gemma 4) has none."""
+    if getattr(tokenizer, "chat_template", None) is None:
+        tokenizer.chat_template = DEFAULT_GEMMA4_CHAT_TEMPLATE
+
+
+@contextlib.contextmanager
+def _no_peft_autodetect():
+    """HybridLink's `adapter_config.json` is not a PEFT config, but when `peft` is installed
+    transformers treats any checkpoint containing that file as a PEFT adapter and fails to
+    load it. Disable that auto-detection while loading the backbone."""
+    import transformers.modeling_utils as modeling_utils
+
+    if not hasattr(modeling_utils, "maybe_load_adapters"):
+        yield
+        return
+    with mock.patch.object(
+        modeling_utils, "maybe_load_adapters",
+        lambda path, download_kwargs, **adapter_kwargs: (None, path, adapter_kwargs),
+    ):
+        yield
 
 
 def resolve_model_dir(path_or_repo: str | os.PathLike, revision: str | None = None) -> Path:
@@ -31,12 +66,32 @@ def resolve_model_dir(path_or_repo: str | os.PathLike, revision: str | None = No
     return Path(snapshot_download(repo_id=str(path_or_repo), revision=revision))
 
 
+def _is_single_known_token(tokenizer, token: str) -> bool:
+    """True when `token` is both a known single vocabulary entry and encodes to that single id."""
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    ids = tokenizer.encode(token, add_special_tokens=False)
+    if len(ids) != 1 or (unk_id is not None and ids[0] == unk_id):
+        return False
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert):
+        tok_id = convert(token)
+        if tok_id is None or (unk_id is not None and tok_id == unk_id) or tok_id != ids[0]:
+            return False
+    return True
+
+
 def add_anchor_tokens(tokenizer) -> int:
-    """Register `<latent>` / `</latent>` as special tokens; returns how many were added."""
+    """Register `<latent>` / `</latent>` as special tokens (plus `<think>` / `</think>` for
+    tokenizers like Gemma 4 where they are not single tokens); returns how many were added."""
     known = set(getattr(tokenizer, "all_special_tokens", None) or [])
     missing = [tok for tok in ANCHOR_TOKENS if tok not in known]
+    for tok in (THINK_OPEN, THINK_CLOSE):
+        if tok not in known and tok not in missing and not _is_single_known_token(tokenizer, tok):
+            missing.append(tok)
     if missing:
-        tokenizer.add_special_tokens({"additional_special_tokens": missing})
+        existing = list(getattr(tokenizer, "additional_special_tokens", None) or [])
+        merged = existing + [t for t in missing if t not in existing]
+        tokenizer.add_special_tokens({"additional_special_tokens": merged})
     return len(missing)
 
 
@@ -60,9 +115,10 @@ class HybridAgentModel(nn.Module):
     ) -> "HybridAgentModel":
         """Load the backbone and, when present, the HybridLink weights of a checkpoint."""
         local = resolve_model_dir(path_or_repo, revision)
-        backbone = AutoModelForCausalLM.from_pretrained(
-            str(local), dtype=dtype, trust_remote_code=trust_remote_code
-        )
+        with _no_peft_autodetect():
+            backbone = AutoModelForCausalLM.from_pretrained(
+                str(local), dtype=dtype, trust_remote_code=trust_remote_code
+            )
         model = cls(backbone)
         weights = local / HYBRIDLINK_WEIGHTS
         if weights.is_file():
@@ -120,6 +176,7 @@ def load_hybrid_agent(
     """Return `(model, tokenizer)` ready for generation from a local dir or HF repo id."""
     local = resolve_model_dir(path_or_repo, revision)
     tokenizer = AutoTokenizer.from_pretrained(str(local), trust_remote_code=trust_remote_code)
+    ensure_chat_template(tokenizer)
     add_anchor_tokens(tokenizer)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:

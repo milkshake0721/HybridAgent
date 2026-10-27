@@ -74,6 +74,8 @@ class HybridRLConfig:
     min_latent_steps: int = 4
     max_latent_steps: int = 200
     search_result_length: int = 500
+    freeze_experts: bool = False
+    use_8bit: bool = False
     wandb: bool = False
 
     @property

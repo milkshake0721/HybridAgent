@@ -52,6 +52,9 @@ class RowState:
     search_query_history: set[str] = field(default_factory=set)
     full_output: str = ""
     _last_decoded_len: int = 0
+    _turn_start_char: int = 0
+    turn_texts: list[str] = field(default_factory=list)
+    turn_latent_steps: list[int] = field(default_factory=lambda: [0])
     pending_tool: tuple[str, str] | None = None
     feed_queue: list[int] = field(default_factory=list)
     readout_ids: list[int] = field(default_factory=list)        # readout of the open span
@@ -193,8 +196,9 @@ class HybridGenerationEngine:
             vocab = self.tokenizer.get_vocab()
         except (AttributeError, TypeError):
             vocab = {}
-        if "<|endoftext|>" in vocab:
-            eos.add(int(vocab["<|endoftext|>"]))
+        for tok_str in ("<|endoftext|>", "<turn|>", "<end_of_turn>"):
+            if tok_str in vocab:
+                eos.add(int(vocab[tok_str]))
         return eos
 
     # ------------------------------------------------------------------
@@ -202,6 +206,9 @@ class HybridGenerationEngine:
     # ------------------------------------------------------------------
 
     def _build_prompt(self) -> str:
+        from .model import ensure_chat_template
+
+        ensure_chat_template(self.tokenizer)
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": self.question},
@@ -215,7 +222,7 @@ class HybridGenerationEngine:
     @torch.no_grad()
     def _init_generation(self) -> bool:
         prompt = self._build_prompt()
-        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
         prompt_ids = inputs["input_ids"][0].tolist()
         self.prompt_len = len(prompt_ids)
         self.prompt_ends_in_think = prompt.rstrip("\n").endswith(THINK_OPEN)
@@ -352,8 +359,16 @@ class HybridGenerationEngine:
     def _decode_step(self, rng: torch.Generator | None) -> None:
         """Advance every DECODE/LATENT/FEED row by one slot; IDLE/DONE rows get PAD."""
         embed_w = self.embed_layer.weight
+        embed_scale = getattr(self.embed_layer, "embed_scale", None)
+        if embed_scale is not None:
+            embed_scale = embed_scale.to(device=embed_w.device, dtype=embed_w.dtype)
+
+        def _tok_embed(tok_id: int) -> torch.Tensor:
+            v = embed_w[tok_id]
+            return v * embed_scale if embed_scale is not None else v
+
         inputs = torch.empty((self.B, 1, embed_w.shape[1]), dtype=embed_w.dtype, device=self.device)
-        pad_embed = embed_w[self.pad_id]
+        pad_embed = _tok_embed(self.pad_id)
 
         sample_rows_list: list[int] = []
         blocked_keys: dict[int, str] = {}
@@ -402,7 +417,7 @@ class HybridGenerationEngine:
                     row.kv_ledger.append(self.latent_close_id)
                     forced_tokens[i] = self.latent_close_id
                     real_rows.append(i)
-                    inputs[i, 0] = embed_w[self.latent_close_id]
+                    inputs[i, 0] = _tok_embed(self.latent_close_id)
                     if exit_reason == "max_steps":
                         row.forced_exits += 1
                     else:
@@ -418,13 +433,14 @@ class HybridGenerationEngine:
                     row.kv_ledger.append(None)
                     row.latent_steps += 1
                     row.latent_steps_total += 1
+                    row.turn_latent_steps[-1] += 1
                     if span_readout is not None:
                         row.readout_ids.append(int(span_readout[pos_in_batch]))
                 continue
 
             if row.mode == FEED:
                 tok = row.feed_queue.pop(0)
-                inputs[i, 0] = embed_w[tok]
+                inputs[i, 0] = _tok_embed(tok)
                 row.kv_ledger.append(tok)
                 self._on_env_token_fed(row)
                 forced_tokens[i] = tok
@@ -472,7 +488,7 @@ class HybridGenerationEngine:
                 row.text_ids_since_resume.append(tok)
                 row.kv_ledger.append(tok)
                 self._record_text_action(row, tok, log_probs[i], blocked_keys[i])
-                inputs[i, 0] = embed_w[tok]
+                inputs[i, 0] = _tok_embed(tok)
                 forced_tokens[i] = tok
                 real_rows.append(i)
 
@@ -579,11 +595,14 @@ class HybridGenerationEngine:
             row.pending_tool = None
             self._flush_new_model_text(row)
             row.full_output += result_text
+            row.turn_texts.append(row.full_output[row._turn_start_char:])
+            row._turn_start_char = len(row.full_output)
             token_ids = self.tokenizer(result_text, add_special_tokens=False)["input_ids"]
             if not self._env_tokens_fit(row, len(token_ids)):
                 continue
             row.feed_queue = list(token_ids)
             row.turn_count += 1
+            row.turn_latent_steps.append(0)
             if token_ids:
                 row.mode = FEED
             else:
@@ -620,6 +639,9 @@ class HybridGenerationEngine:
             self._decode_step(rng)
         for row in self.rows:
             self._flush_new_model_text(row)
+            if row._turn_start_char < len(row.full_output) or not row.turn_texts:
+                row.turn_texts.append(row.full_output[row._turn_start_char:])
+                row._turn_start_char = len(row.full_output)
             if row.readout_ids:
                 self._close_span_readout(row, row.end_reason or "budget")
         self.total_time = time.time() - start
@@ -628,6 +650,10 @@ class HybridGenerationEngine:
         out = {
             "output": row.full_output,
             "turns": row.turn_count,
+            "rounds": [
+                {"text": txt, "latent_steps": steps}
+                for txt, steps in zip(row.turn_texts, row.turn_latent_steps)
+            ],
             "python_calls": row.python_calls,
             "search_calls": row.search_calls,
             "tool_requests": row.tool_requests,
@@ -642,3 +668,165 @@ class HybridGenerationEngine:
             out["latent_readouts"] = [span.to_dict() for span in row.latent_spans]
             out["output_rendered"] = render_with_readout(row.full_output, row.latent_spans)
         return out
+
+
+@dataclass
+class HybridRound:
+    """Single-turn summary returned by the high-level HybridEngine wrapper."""
+    text: str
+    latent_steps: int = 0
+
+
+@dataclass
+class HybridTrajectory:
+    """High-level trajectory returned by HybridEngine.run()."""
+    rounds: list[HybridRound]
+    final_answer: str
+    output: str = ""
+    output_rendered: str = ""
+    latent_steps: int = 0
+    latent_spans: int = 0
+    raw_result: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_latent_steps(self) -> int:
+        return self.latent_steps
+
+    @property
+    def n_latent_spans(self) -> int:
+        return self.latent_spans
+
+    @property
+    def turns(self) -> int:
+        return len(self.rounds)
+
+
+def _parse_rounds_from_result(res: dict[str, Any]) -> list[HybridRound]:
+    """Build per-turn HybridRound objects from row_result(), falling back to output parsing
+    when a caller provides a synthetic result dict without pre-recorded `rounds`."""
+    import re
+
+    recorded = res.get("rounds")
+    if isinstance(recorded, list) and recorded:
+        return [
+            HybridRound(text=str(r.get("text", "")), latent_steps=int(r.get("latent_steps", 0)))
+            for r in recorded
+        ]
+    full_out = res.get("output", "")
+    tokens = re.split(r"(<result>.*?</result>)", full_out, flags=re.DOTALL)
+    raw_chunks: list[tuple[str, str]] = []
+    idx = 0
+    while idx < len(tokens):
+        assistant_part = tokens[idx]
+        result_part = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+        chunk = assistant_part + result_part
+        if chunk.strip() or not raw_chunks:
+            raw_chunks.append((chunk, assistant_part))
+        idx += 2
+
+    closed_marker = f"{ENTRY_ANCHOR}{EXIT_ANCHOR}"
+    non_think_re = re.compile(
+        r"<(?:python|search|result|answer)>.*?(?:</(?:python|search|result|answer)>|$)",
+        flags=re.DOTALL,
+    )
+    span_counts: list[int] = []
+    for _, assistant_part in raw_chunks:
+        think_only = non_think_re.sub("", assistant_part)
+        n_closed = think_only.count(closed_marker)
+        n_unclosed = think_only.replace(closed_marker, "").count(ENTRY_ANCHOR)
+        span_counts.append(n_closed + n_unclosed)
+
+    readouts = list(res.get("latent_readouts") or [])
+    total_steps = int(res.get("latent_steps", 0))
+    total_spans = sum(span_counts)
+    span_cursor = 0
+    rounds: list[HybridRound] = []
+    for (chunk, _), n_spans in zip(raw_chunks, span_counts):
+        if readouts:
+            round_steps = sum(
+                int(s.get("steps", 0)) for s in readouts[span_cursor : span_cursor + n_spans]
+            )
+            span_cursor += n_spans
+        elif total_spans > 0:
+            round_steps = (total_steps * n_spans) // total_spans
+        else:
+            round_steps = total_steps if not rounds else 0
+        rounds.append(HybridRound(text=chunk, latent_steps=round_steps))
+    return rounds
+
+
+class HybridEngine:
+    """High-level convenience wrapper around HybridGenerationEngine for single-question inference."""
+
+    def __init__(
+        self,
+        model,
+        tokenizer,
+        *,
+        max_new_tokens: int = 1024,
+        min_latent_steps: int = 4,
+        max_latent_steps: int = 64,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        top_k: int = 20,
+        record_latent_readout: bool = True,
+        tool_executor: ToolExecutor | None = None,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_new_tokens = max_new_tokens
+        self.min_latent_steps = min_latent_steps
+        self.max_latent_steps = max_latent_steps
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.record_latent_readout = record_latent_readout
+        self.tool_executor = tool_executor
+
+    def run(
+        self,
+        question: str,
+        system_prompt: str | None = None,
+        seed: int | None = 0,
+    ) -> HybridTrajectory:
+        from .answer import extract_answer
+        from .prompts import SYSTEM_PROMPT
+        from .tools import build_tool_executor
+
+        device = next(self.model.parameters()).device
+        tools = self.tool_executor if self.tool_executor is not None else build_tool_executor(require_search=False)
+        sys_prompt = system_prompt if system_prompt is not None else SYSTEM_PROMPT
+        gen_engine = HybridGenerationEngine(
+            self.model,
+            self.tokenizer,
+            device,
+            tools,
+            sys_prompt,
+            question,
+            batch_size=1,
+            max_response_tokens=self.max_new_tokens,
+            min_latent_steps=self.min_latent_steps,
+            max_latent_steps=self.max_latent_steps,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            record_latent_readout=self.record_latent_readout,
+        )
+        rng = None
+        if seed is not None:
+            rng = torch.Generator(device=device).manual_seed(int(seed))
+        gen_engine.run(rng)
+        res = gen_engine.row_result(gen_engine.rows[0])
+        full_out = res.get("output", "")
+        ans = extract_answer(full_out) or ""
+        rounds = _parse_rounds_from_result(res)
+        return HybridTrajectory(
+            rounds=rounds,
+            final_answer=ans,
+            output=full_out,
+            output_rendered=res.get("output_rendered", full_out),
+            latent_steps=res.get("latent_steps", 0),
+            latent_spans=res.get("latent_spans", 0),
+            raw_result=res,
+        )
+

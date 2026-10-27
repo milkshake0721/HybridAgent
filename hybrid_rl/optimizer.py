@@ -19,12 +19,14 @@ class ZeroOneAdamW:
         betas=(0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        use_8bit: bool = False,
     ):
         self.rank = int(rank)
         self.world = int(world_size)
         self.betas = tuple(float(value) for value in betas)
         self.eps = float(eps)
         self.weight_decay = float(weight_decay)
+        self.use_8bit = bool(use_8bit)
         if len(self.betas) != 2 or any(not 0.0 <= value < 1.0 for value in self.betas):
             raise ValueError("betas must contain two values in [0, 1)")
         if self.world < 1 or not 0 <= self.rank < self.world:
@@ -32,9 +34,11 @@ class ZeroOneAdamW:
         self.step_count = 0
 
         flat: list[tuple[torch.nn.Parameter, float]] = []
+        seen_params: set[int] = set()
         for group in param_groups:
             for parameter in group["params"]:
-                if parameter.requires_grad:
+                if parameter.requires_grad and id(parameter) not in seen_params:
+                    seen_params.add(id(parameter))
                     flat.append((parameter, float(group["lr"])))
         if not flat:
             raise ValueError("ZeroOneAdamW received no trainable parameters")
@@ -55,16 +59,31 @@ class ZeroOneAdamW:
         self.exp_avg: dict[int, torch.Tensor] = {}
         self.exp_avg_sq: dict[int, torch.Tensor] = {}
         self.param_steps: dict[int, int] = {}   # per-parameter bias correction, as in torch AdamW
-        for index, (parameter, _) in enumerate(flat):
+        owned_groups: dict[float, list[torch.nn.Parameter]] = {}
+        self.owned_numel = 0
+        for index, (parameter, lr) in enumerate(flat):
             if self.owner[index] != self.rank:
                 continue
-            direct_fp32 = parameter.dtype == torch.float32
-            self.master_is_parameter[index] = direct_fp32
-            self.master[index] = parameter.data if direct_fp32 else parameter.detach().float().clone()
-            self.exp_avg[index] = torch.zeros_like(self.master[index])
-            self.exp_avg_sq[index] = torch.zeros_like(self.master[index])
-            self.param_steps[index] = 0
-        self.owned_numel = sum(tensor.numel() for tensor in self.master.values())
+            self.owned_numel += parameter.numel()
+            if self.use_8bit:
+                owned_groups.setdefault(lr, []).append(parameter)
+            else:
+                direct_fp32 = parameter.dtype == torch.float32
+                self.master_is_parameter[index] = direct_fp32
+                self.master[index] = parameter.data if direct_fp32 else parameter.detach().float().clone()
+                self.exp_avg[index] = torch.zeros_like(self.master[index])
+                self.exp_avg_sq[index] = torch.zeros_like(self.master[index])
+                self.param_steps[index] = 0
+        self._bnb_opt = None
+        if self.use_8bit and owned_groups:
+            import bitsandbytes as bnb
+
+            self._bnb_opt = bnb.optim.PagedAdamW8bit(
+                [{"params": params, "lr": lr} for lr, params in owned_groups.items()],
+                betas=self.betas,
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+            )
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for parameter in self.params:
@@ -143,6 +162,13 @@ class ZeroOneAdamW:
     @torch.no_grad()
     def step(self) -> None:
         self.step_count += 1
+        if self.use_8bit:
+            if self._bnb_opt is not None:
+                self._bnb_opt.step()
+            if self.world > 1:
+                for index, parameter in enumerate(self.params):
+                    dist.broadcast(parameter.data, src=self.owner[index])
+            return
         beta1, beta2 = self.betas
         for index, parameter in enumerate(self.params):
             if self.owner[index] != self.rank or parameter.grad is None:
@@ -168,5 +194,6 @@ class ZeroOneAdamW:
                 dist.broadcast(parameter.data, src=self.owner[index])
 
     def state_summary(self) -> str:
-        return (f"ZeRO-1 AdamW: {len(self.params)} tensors; rank {self.rank} owns "
+        mode = "PagedAdamW8bit (BF16 weights + BF16 grads)" if self.use_8bit else "ZeRO-1 FP32 AdamW"
+        return (f"{mode}: {len(self.params)} tensors; rank {self.rank} owns "
                 f"{self.owned_numel / 1e6:.1f}M parameters")

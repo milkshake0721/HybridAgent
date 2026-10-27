@@ -13,7 +13,8 @@ math-verify==0.9.0
 tavily-python==0.7.26
 python-dotenv==1.2.2
 tqdm
-# HybridSFT (DeepSpeed ZeRO-2)
+# HybridSFT (DeepSpeed ZeRO-2 / 8-bit AdamW)
 deepspeed==0.19.2
+bitsandbytes>=0.45.0
 # optional
 # wandb==0.28.0

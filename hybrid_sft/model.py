@@ -30,13 +30,24 @@ CE_CHUNK_SIZE = 2048
 
 class HybridSFTModel(HybridAgentModel):
 
-    def set_trainable(self, stage: str) -> None:
+    def set_trainable(self, stage: str, freeze_experts: bool = False) -> None:
         if stage not in STAGES:
             raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
         train_backbone = stage in (FORMAT_ACTIVATION, SELF_CONDITIONED)
         train_link = stage in (HYBRIDLINK_ACTIVATION, SELF_CONDITIONED)
         for p in self.backbone.parameters():
-            p.requires_grad = train_backbone
+            p.requires_grad = False
+        if train_backbone:
+            for mod in (
+                self.backbone.get_decoder(),
+                self.backbone.get_input_embeddings(),
+                self.backbone.get_output_embeddings(),
+            ):
+                if mod is not None:
+                    for name, p in mod.named_parameters():
+                        if freeze_experts and ".experts." in f".{name}":
+                            continue
+                        p.requires_grad = True
         for p in self.hybridlink.parameters():
             p.requires_grad = train_link
 
@@ -95,21 +106,22 @@ class HybridSFTModel(HybridAgentModel):
 
         if stage == SELF_CONDITIONED:
             # pass 1: teacher forced; HybridLink predicts the next latent inputs one step ahead
-            with torch.no_grad():
-                teacher_embeds = embed_layer(input_ids)
+            teacher_embeds = input_embeds.detach()
             hidden = decoder(
                 inputs_embeds=input_embeds, attention_mask=attention_mask,
                 use_cache=False, return_dict=True,
             ).last_hidden_state
             input_embeds_mod = teacher_embeds.clone()
             pred_next = self.run_hybridlink(hidden[:, :-1], output_dtype=teacher_embeds.dtype)
-            mask = latent_mask[:, :-1].unsqueeze(-1).expand_as(pred_next).bool()
+            mask = latent_mask[:, :-1].unsqueeze(-1).bool()
             input_embeds_mod[:, 1:, :] = torch.where(mask, pred_next, input_embeds_mod[:, 1:, :])
+            del pred_next, mask
             # pass 2: the model's own latent inputs replace the ground-truth embeddings
             hidden = decoder(
                 inputs_embeds=input_embeds_mod, attention_mask=attention_mask,
                 use_cache=False, return_dict=True,
             ).last_hidden_state
+            del input_embeds_mod
             target_embeds = teacher_embeds
         else:
             hidden = decoder(

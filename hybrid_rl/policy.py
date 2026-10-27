@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from hybrid_agent.model import HybridAgentModel, add_anchor_tokens, resolve_model_dir
+from hybrid_agent.model import HybridAgentModel, add_anchor_tokens, ensure_chat_template, resolve_model_dir
 
 _DROPOUT_NAMES = (
     "attention_dropout", "hidden_dropout", "hidden_dropout_prob", "resid_pdrop", "embd_pdrop", "dropout",
@@ -57,9 +57,10 @@ def disable_dropout(module: torch.nn.Module) -> int:
     return count
 
 
-def load_policy(spec: str, device) -> tuple[HybridAgentModel, "AutoTokenizer"]:
+def load_policy(spec: str, device, *, freeze_experts: bool = False) -> tuple[HybridAgentModel, "AutoTokenizer"]:
     local = resolve_model_dir(spec)
     tokenizer = AutoTokenizer.from_pretrained(str(local))
+    ensure_chat_template(tokenizer)
     add_anchor_tokens(tokenizer)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -72,7 +73,17 @@ def load_policy(spec: str, device) -> tuple[HybridAgentModel, "AutoTokenizer"]:
             "start from a complete HybridSFT checkpoint"
         )
     for parameter in model.backbone.parameters():
-        parameter.requires_grad_(True)
+        parameter.requires_grad_(False)
+    for mod in (
+        model.backbone.get_decoder(),
+        model.backbone.get_input_embeddings(),
+        model.backbone.get_output_embeddings(),
+    ):
+        if mod is not None:
+            for name, parameter in mod.named_parameters():
+                if freeze_experts and ".experts." in f".{name}":
+                    continue
+                parameter.requires_grad_(True)
     for parameter in model.hybridlink.parameters():
         parameter.requires_grad_(False)
     disable_dropout(model.backbone)
