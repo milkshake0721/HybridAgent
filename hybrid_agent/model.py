@@ -2,6 +2,7 @@
 
 Provides the anchor-token registration, HybridLink application, checkpoint save/load
 and a loader that accepts either a local directory or a Hugging Face repo id.
+Supports both BF16 checkpoints and 4-bit compressed-tensors (pack-quantized W4A16) checkpoints.
 Shared by HybridSFT, HybridRL and inference.
 """
 from __future__ import annotations
@@ -18,9 +19,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .constants import ANCHOR_TOKENS, THINK_CLOSE, THINK_OPEN
 from .hybridlink import HYBRIDLINK_CONFIG, HybridLink
+from .quantization import is_pack_quantized_dir, load_pack_quantized_backbone
 
 HYBRIDLINK_WEIGHTS = "adapter.pt"
+HYBRIDLINK_ALT_WEIGHTS = "hybridlink.pt"
 HYBRIDLINK_CONFIG_FILE = "adapter_config.json"
+HYBRIDLINK_ALT_CONFIG_FILE = "hybridlink_config.json"
 
 DEFAULT_GEMMA4_CHAT_TEMPLATE = (
     "{% for message in messages %}"
@@ -112,17 +116,31 @@ class HybridAgentModel(nn.Module):
         trust_remote_code: bool = False,
         require_hybridlink: bool = False,
         revision: str | None = None,
+        gradient_checkpointing: bool = False,
     ) -> "HybridAgentModel":
-        """Load the backbone and, when present, the HybridLink weights of a checkpoint."""
+        """Load the backbone (BF16 or 4-bit pack-quantized) and the HybridLink weights."""
         local = resolve_model_dir(path_or_repo, revision)
-        with _no_peft_autodetect():
-            backbone = AutoModelForCausalLM.from_pretrained(
-                str(local), dtype=dtype, trust_remote_code=trust_remote_code
+        if is_pack_quantized_dir(local):
+            backbone = load_pack_quantized_backbone(
+                local, dtype=dtype, trust_remote_code=trust_remote_code
             )
+        else:
+            with _no_peft_autodetect():
+                backbone = AutoModelForCausalLM.from_pretrained(
+                    str(local), dtype=dtype, trust_remote_code=trust_remote_code
+                )
+        if gradient_checkpointing and hasattr(backbone, "gradient_checkpointing_enable"):
+            backbone.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model = cls(backbone)
+
         weights = local / HYBRIDLINK_WEIGHTS
+        if not weights.is_file():
+            weights = local / HYBRIDLINK_ALT_WEIGHTS
+
         if weights.is_file():
             config_file = local / HYBRIDLINK_CONFIG_FILE
+            if not config_file.is_file():
+                config_file = local / HYBRIDLINK_ALT_CONFIG_FILE
             if config_file.is_file():
                 tag = json.loads(config_file.read_text(encoding="utf-8")).get("adapter_type")
                 if tag != HYBRIDLINK_CONFIG["adapter_type"]:
@@ -130,7 +148,7 @@ class HybridAgentModel(nn.Module):
             state = torch.load(str(weights), map_location="cpu", weights_only=True)
             model.hybridlink.load_state_dict(state, strict=True)
         elif require_hybridlink:
-            raise FileNotFoundError(f"{HYBRIDLINK_WEIGHTS} not found in {local}")
+            raise FileNotFoundError(f"{HYBRIDLINK_WEIGHTS} / {HYBRIDLINK_ALT_WEIGHTS} not found in {local}")
         return model
 
     def run_hybridlink(
@@ -172,8 +190,16 @@ def load_hybrid_agent(
     trust_remote_code: bool = False,
     require_hybridlink: bool = True,
     revision: str | None = None,
+    backend: str = "eager",
 ):
-    """Return `(model, tokenizer)` ready for generation from a local dir or HF repo id."""
+    """Return `(model, tokenizer)` ready for generation from a local dir or HF repo id.
+
+    Args:
+        backend: `"eager"` (default, with zero-sync BF16/4-bit MoE fast path) or
+                 `"tensorrt"` (compiles `HybridLink` via `torch_tensorrt` and fuses MoE decode).
+    """
+    from .backends import enable_tensorrt_acceleration, patch_bf16_experts_fastpath
+
     local = resolve_model_dir(path_or_repo, revision)
     tokenizer = AutoTokenizer.from_pretrained(str(local), trust_remote_code=trust_remote_code)
     ensure_chat_template(tokenizer)
@@ -186,7 +212,10 @@ def load_hybrid_agent(
         require_hybridlink=require_hybridlink, revision=revision,
     )
     model.resize_to_tokenizer(tokenizer)
+    patch_bf16_experts_fastpath(model.backbone)
     if device is not None:
         model.to(device)
     model.eval()
+    if backend in ("tensorrt", "trt", "compile"):
+        enable_tensorrt_acceleration(model)
     return model, tokenizer

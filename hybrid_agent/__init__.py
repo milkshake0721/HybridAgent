@@ -4,6 +4,14 @@ Core package shared by HybridSFT, HybridRL and inference: the HybridLink adapter
 model wrapper and loader, the system prompt, and the hybrid generation engine with its tools.
 """
 from .answer import extract_answer, strip_latent_spans
+from .backends import (
+    SGLangHybridEngine,
+    compile_hybridlink_tensorrt,
+    enable_tensorrt_acceleration,
+    get_sglang_server_command,
+    patch_bf16_experts_fastpath,
+    prepare_sglang_model_dir,
+)
 from .constants import ANCHOR_TOKENS, ENTRY_ANCHOR, EXIT_ANCHOR, special_token_id
 from .engine import (
     DECODE,
@@ -28,7 +36,9 @@ __all__ = [
     "DECODE", "LATENT", "FEED", "IDLE", "DONE",
     "HybridAgentModel", "HybridEngine", "HybridGenerationEngine", "HybridLink",
     "HybridRound", "HybridTrajectory", "LatentSpanReadout", "RowState",
-    "ToolExecutor", "add_anchor_tokens", "build_tool_executor", "extract_answer",
-    "latent_readout", "load_hybrid_agent", "render_with_readout", "resolve_model_dir",
-    "special_token_id", "strip_latent_spans",
+    "SGLangHybridEngine", "ToolExecutor", "add_anchor_tokens", "build_tool_executor",
+    "compile_hybridlink_tensorrt", "enable_tensorrt_acceleration", "extract_answer",
+    "get_sglang_server_command", "latent_readout", "load_hybrid_agent",
+    "patch_bf16_experts_fastpath", "prepare_sglang_model_dir", "render_with_readout",
+    "resolve_model_dir", "special_token_id", "strip_latent_spans",
 ]
