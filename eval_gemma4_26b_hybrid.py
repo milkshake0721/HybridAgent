@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Evaluate Gemma-4-26B-A4B-HybridAgent (BF16 or 4-bit) on the 10-question math/logic benchmark."""
+"""Evaluate Gemma-4-26B-A4B-HybridAgent (BF16 or 4-bit) on the 10-question math/logic benchmark
+using high-concurrency batched TensorRT execution, or optionally delegate to the 5-benchmark
+HuggingFace evaluation suite (`eval_hf_benchmarks.py`).
+"""
 from __future__ import annotations
 
+import argparse
+from collections.abc import Sequence
 import json
 import os
+from pathlib import Path
 import re
 import sys
 import time
-from pathlib import Path
 
 import torch
 
@@ -45,42 +50,141 @@ def normalize_math_answer(ans: str) -> str:
     return nums[-1].strip() if nums else s
 
 
-def main():
-    source = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_MODEL
-    out_json = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_OUT
-    backend = sys.argv[3] if len(sys.argv) > 3 else "tensorrt"
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Evaluate Gemma-4-26B-A4B-HybridAgent with Batched TensorRT")
+    p.add_argument("pos_model", nargs="?", default=None, help="Positional model path or repo ID")
+    p.add_argument("pos_output", nargs="?", default=None, help="Positional output JSON path")
+    p.add_argument("pos_backend", nargs="?", default=None, help="Positional backend ('tensorrt', 'eager', 'sglang')")
+    p.add_argument("pos_batch_size", nargs="?", type=int, default=None, help="Positional batch size")
+    p.add_argument("--model", default=None, help="Model path or Hugging Face repo ID")
+    p.add_argument("--output", "--out", dest="output", default=None, help="Output JSON file path")
+    p.add_argument("--backend", choices=("tensorrt", "eager", "sglang"), default=None)
+    p.add_argument(
+        "--batch-size",
+        "--batch_size",
+        "--concurrency",
+        dest="batch_size",
+        type=int,
+        default=None,
+        help="Concurrent question batch size (default: 10)",
+    )
+    p.add_argument("--no-tools", "--no_tools", dest="no_tools", action="store_true")
+    p.add_argument(
+        "--hf-benchmarks",
+        "--benchmarks",
+        dest="hf_benchmarks",
+        nargs="*",
+        default=None,
+        help="Optional 5-benchmark HF suite names to run via eval_hf_benchmarks",
+    )
+    p.add_argument("--output-dir", "--output_dir", dest="output_dir", default="outputs/benchmarks")
+    p.add_argument("--dataset-dir", "--dataset_dir", dest="dataset_dir", default=None)
+    p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--synthetic-smoke", "--dry-run", dest="synthetic_smoke", action="store_true")
+    args = p.parse_args(argv)
+
+    args.model = args.model or args.pos_model or DEFAULT_MODEL
+    args.output = args.output or args.pos_output or DEFAULT_OUT
+    args.backend = args.backend or args.pos_backend or "tensorrt"
+    args.batch_size = args.batch_size or args.pos_batch_size or len(BENCHMARK)
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> dict:
+    args = parse_args(argv)
+
+    if args.hf_benchmarks is not None:
+        import eval_hf_benchmarks
+
+        hf_args = argparse.Namespace(
+            model=args.model,
+            backend=args.backend,
+            benchmarks=args.hf_benchmarks if args.hf_benchmarks else ["all"],
+            batch_size=args.batch_size,
+            limit=args.limit,
+            dataset_dir=args.dataset_dir,
+            output_dir=args.output_dir,
+            synthetic_smoke=args.synthetic_smoke,
+            seed=42,
+            vram_gb=96.0,
+            max_new_tokens=4096,
+            max_latent_steps=32,
+            temperature=0.0,
+        )
+        return eval_hf_benchmarks.run_suite(hf_args)
+
+    source = args.model
+    out_json = args.output
+    backend = args.backend
+    batch_size = max(1, int(args.batch_size))
     os.makedirs(os.path.dirname(os.path.abspath(out_json)), exist_ok=True)
 
-    model, tokenizer = load_hybrid_agent(source, dtype=torch.bfloat16, device="cuda", backend=backend)
-    engine = HybridEngine(model, tokenizer, max_new_tokens=1024, max_latent_steps=64, temperature=0.0, top_p=1.0)
+    max_tc = 0 if args.no_tools else 6
+    model, tokenizer = load_hybrid_agent(
+        source,
+        dtype=torch.bfloat16,
+        device="cuda",
+        backend=backend,
+        max_batch_size=max(32, batch_size),
+    )
+    engine = HybridEngine(
+        model,
+        tokenizer,
+        max_new_tokens=1024,
+        max_latent_steps=64,
+        temperature=0.0,
+        top_p=1.0,
+        max_tool_calls=max_tc,
+        max_python_calls=max_tc,
+        max_search_calls=max_tc,
+        default_batch_size=batch_size,
+    )
+
+    questions = [item["q"] for item in BENCHMARK]
+    t0 = time.time()
+    trajectories = engine.run_batch(questions, batch_size=batch_size, system_prompt=SYSTEM_PROMPT)
+    total_dt = max(1e-6, time.time() - t0)
+    avg_dt = total_dt / max(1, len(BENCHMARK))
 
     results = []
     correct = 0
-    for item in BENCHMARK:
-        t0 = time.time()
-        traj = engine.run(item["q"], system_prompt=SYSTEM_PROMPT)
-        dt = time.time() - t0
+    for item, traj in zip(BENCHMARK, trajectories):
         raw_ans = traj.final_answer or extract_answer(traj.output)
         pred = normalize_math_answer(raw_ans)
         ok = pred == item["expected"]
         correct += int(ok)
         latent_steps = sum(r.latent_steps for r in traj.rounds)
-        print(f"[Q{item['id']:02d}] {'PASS' if ok else 'FAIL'} | expected={item['expected']} pred={pred} (raw={raw_ans!r}) | latent_steps={latent_steps} | {dt:.1f}s")
-        results.append({
-            "id": item["id"],
-            "question": item["q"],
-            "expected": item["expected"],
-            "predicted": pred,
-            "raw_answer": raw_ans,
-            "correct": ok,
-            "latent_steps": latent_steps,
-            "time_s": round(dt, 2),
-        })
+        print(
+            f"[Q{item['id']:02d}] {'PASS' if ok else 'FAIL'} | expected={item['expected']} "
+            f"pred={pred} (raw={raw_ans!r}) | latent_steps={latent_steps} | {avg_dt:.1f}s"
+        )
+        results.append(
+            {
+                "id": item["id"],
+                "question": item["q"],
+                "expected": item["expected"],
+                "predicted": pred,
+                "raw_answer": raw_ans,
+                "correct": ok,
+                "latent_steps": latent_steps,
+                "time_s": round(avg_dt, 2),
+            }
+        )
 
-    print(f"\n=== Accuracy: {correct}/{len(BENCHMARK)} ({correct / len(BENCHMARK) * 100:.1f}%) ===")
+    accuracy = correct / len(BENCHMARK)
+    payload = {
+        "accuracy": accuracy,
+        "backend": backend,
+        "batch_size": batch_size,
+        "wall_time_s": round(total_dt, 2),
+        "questions_per_sec": round(len(BENCHMARK) / total_dt, 2),
+        "results": results,
+    }
+    print(f"\n=== Accuracy: {correct}/{len(BENCHMARK)} ({accuracy * 100:.1f}%) in {total_dt:.2f}s ===")
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({"accuracy": correct / len(BENCHMARK), "results": results}, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"Saved evaluation results to {out_json}")
+    return payload
 
 
 if __name__ == "__main__":

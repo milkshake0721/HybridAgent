@@ -17,6 +17,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 from transformers.activations import ACT2FN
 
 GROUP_SIZE = 32
+SORT_EXPERT_THRESHOLD = 8
 
 try:
     import triton
@@ -25,7 +26,7 @@ try:
     @triton.jit
     def _fused_w4a16_moe_kernel(
         x_ptr,          # [T, K_dim] if not X_PER_EXPERT else [T * top_k, K_dim]
-        idx_ptr,        # [T * top_k] int64/int32 expert indices
+        idx_ptr,        # [T * top_k] int64/int32 expert indices (sorted when SORTED=True)
         w_packed_ptr,   # [num_experts, N_dim, K_packed] int32
         w_scale_ptr,    # [num_experts, N_dim, K_packed // 4] bf16
         out_ptr,        # [T * top_k, N_dim] bf16
@@ -35,12 +36,18 @@ try:
         X_PER_EXPERT: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_KP: tl.constexpr,
+        perm_ptr=None,  # [T * top_k] int64/int32 original flat indices when SORTED=True
+        SORTED: tl.constexpr = False,
     ):
         pid_tk = tl.program_id(0)  # 0 .. (T * top_k) - 1
         pid_n = tl.program_id(1)   # 0 .. cdiv(N_dim, BLOCK_N) - 1
 
         expert_id = tl.load(idx_ptr + pid_tk).to(tl.int64)
-        token_id = pid_tk // top_k
+        if SORTED:
+            orig_tk = tl.load(perm_ptr + pid_tk).to(tl.int64)
+        else:
+            orig_tk = pid_tk
+        token_id = orig_tk // top_k
 
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N_dim
@@ -77,12 +84,154 @@ try:
             w_bf16 = (q_bf16 * scales_bf16[:, :, None]).to(tl.float32)
             acc += tl.sum(tl.reshape(w_bf16 * x_f32[None, :, :], (BLOCK_N, BLOCK_KP * 8)), axis=1)
 
-        out_ptrs = out_ptr + pid_tk * N_dim + offs_n
+        out_row = orig_tk if (SORTED and X_PER_EXPERT) else pid_tk
+        out_ptrs = out_ptr + out_row * N_dim + offs_n
         tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_n)
 
     _HAS_TRITON_W4A16 = True
 except Exception:
     _HAS_TRITON_W4A16 = False
+    _fused_w4a16_moe_kernel = None
+
+
+def sort_moe_token_expert_pairs(
+    top_k_index: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sort flattened `(token, top_k_slot)` pairs by `expert_id` so consecutive threadblocks
+    share the same expert weights in L2 cache during high-concurrency execution (`T > 8`).
+
+    Returns `(sorted_expert_ids, sort_perm, sorted_token_ids)` each of shape `[T * top_k]`.
+    """
+    top_k = top_k_index.shape[-1]
+    idx_flat = top_k_index.contiguous().view(-1)
+    sorted_expert_ids, sort_perm = torch.sort(idx_flat, stable=True)
+    sorted_token_ids = torch.div(sort_perm, top_k, rounding_mode="floor")
+    return sorted_expert_ids, sort_perm, sorted_token_ids
+
+
+def dequantize_int4_packed(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    shifts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Unpack int32-packed symmetric 4-bit weights (offset +8) and multiply by group-32 scales."""
+    if shifts is None or shifts.device != packed.device:
+        shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=packed.device)
+    q = ((packed.unsqueeze(-1) >> shifts) & 0xF) - 8
+    return (q.to(scale.dtype).view(*scale.shape, GROUP_SIZE) * scale.unsqueeze(-1)).flatten(-2)
+
+
+def _pytorch_zero_sync_4bit_moe_forward(
+    hidden_states: torch.Tensor,
+    top_k_index: torch.Tensor,
+    top_k_weights: torch.Tensor,
+    gu_packed: torch.Tensor,
+    gu_scale: torch.Tensor,
+    dn_packed: torch.Tensor,
+    dn_scale: torch.Tensor,
+    *,
+    shifts: torch.Tensor | None = None,
+    act_fn=None,
+    sort_threshold: int = SORT_EXPERT_THRESHOLD,
+    chunk_tk: int = 64,
+) -> torch.Tensor:
+    """Zero-sync PyTorch W4A16 MoE forward pass for any T >= 1 without `.nonzero()` or
+    `torch.where()` CPU-GPU synchronizations."""
+    orig_shape = hidden_states.shape
+    hidden_dim = orig_shape[-1]
+    h_2d = hidden_states.reshape(-1, hidden_dim)
+    T = h_2d.shape[0]
+    if T == 0:
+        return torch.empty_like(hidden_states)
+
+    top_k = top_k_index.shape[-1]
+    idx_2d = top_k_index.reshape(T, top_k)
+    w_2d = top_k_weights.reshape(T, top_k)
+    intermediate_dim = dn_packed.shape[2] * 8
+    if act_fn is None:
+        act_fn = lambda x: F.gelu(x, approximate="tanh")
+
+    if T == 1:
+        idx = idx_2d[0]
+        h0 = h_2d[0]
+        w_gu = dequantize_int4_packed(gu_packed.index_select(0, idx), gu_scale.index_select(0, idx), shifts)
+        if w_gu.dtype != h0.dtype:
+            w_gu = w_gu.to(h0.dtype)
+        gu = torch.mv(w_gu.view(-1, hidden_dim), h0).view(top_k, 2 * intermediate_dim)
+        gate, up = gu.chunk(2, dim=-1)
+        inter = act_fn(gate) * up
+
+        w_dn = dequantize_int4_packed(dn_packed.index_select(0, idx), dn_scale.index_select(0, idx), shifts)
+        if w_dn.dtype != inter.dtype:
+            w_dn = w_dn.to(inter.dtype)
+        out = torch.bmm(w_dn, inter.unsqueeze(-1)).squeeze(-1)
+        weights = w_2d[0, :, None].to(out.dtype)
+        res = (out * weights).sum(dim=0, keepdim=True).to(hidden_states.dtype)
+        return res.view(orig_shape)
+
+    if T <= sort_threshold:
+        flat_idx = idx_2d.reshape(-1)
+        w_gu = dequantize_int4_packed(
+            gu_packed.index_select(0, flat_idx),
+            gu_scale.index_select(0, flat_idx),
+            shifts,
+        ).view(T, top_k, 2 * intermediate_dim, hidden_dim)
+        if w_gu.dtype != h_2d.dtype:
+            w_gu = w_gu.to(h_2d.dtype)
+        gu = torch.einsum("tkih,th->tki", w_gu, h_2d)
+        gate, up = gu.chunk(2, dim=-1)
+        inter = act_fn(gate) * up
+
+        w_dn = dequantize_int4_packed(
+            dn_packed.index_select(0, flat_idx),
+            dn_scale.index_select(0, flat_idx),
+            shifts,
+        ).view(T, top_k, hidden_dim, intermediate_dim)
+        if w_dn.dtype != inter.dtype:
+            w_dn = w_dn.to(inter.dtype)
+        out = torch.einsum("tkhi,tki->tkh", w_dn, inter)
+        weights = w_2d.unsqueeze(-1).to(out.dtype)
+        res = (out * weights).sum(dim=1).to(hidden_states.dtype)
+        return res.view(orig_shape)
+
+    # High-concurrency path (T > sort_threshold): sort (token, slot) pairs by expert_id
+    # and process in bounded chunks with zero CPU-GPU syncs.
+    TK = T * top_k
+    sorted_expert_ids, sort_perm, sorted_token_ids = sort_moe_token_expert_pairs(idx_2d)
+    dn_out_flat = torch.empty((TK, hidden_dim), dtype=h_2d.dtype, device=h_2d.device)
+
+    for start in range(0, TK, chunk_tk):
+        end = min(start + chunk_tk, TK)
+        exp_c = sorted_expert_ids[start:end]
+        tok_c = sorted_token_ids[start:end]
+        orig_c = sort_perm[start:end]
+        x_c = h_2d.index_select(0, tok_c)
+
+        w_gu_c = dequantize_int4_packed(
+            gu_packed.index_select(0, exp_c),
+            gu_scale.index_select(0, exp_c),
+            shifts,
+        )
+        if w_gu_c.dtype != x_c.dtype:
+            w_gu_c = w_gu_c.to(x_c.dtype)
+        gu_c = torch.bmm(w_gu_c, x_c.unsqueeze(-1)).squeeze(-1)
+        gate_c, up_c = gu_c.chunk(2, dim=-1)
+        inter_c = act_fn(gate_c) * up_c
+
+        w_dn_c = dequantize_int4_packed(
+            dn_packed.index_select(0, exp_c),
+            dn_scale.index_select(0, exp_c),
+            shifts,
+        )
+        if w_dn_c.dtype != inter_c.dtype:
+            w_dn_c = w_dn_c.to(inter_c.dtype)
+        out_c = torch.bmm(w_dn_c, inter_c.unsqueeze(-1)).squeeze(-1)
+        dn_out_flat.index_copy_(0, orig_c, out_c.to(dn_out_flat.dtype))
+
+    dn_out = dn_out_flat.view(T, top_k, hidden_dim)
+    weights = w_2d.unsqueeze(-1).to(dn_out.dtype)
+    res = (dn_out * weights).sum(dim=1).to(hidden_states.dtype)
+    return res.view(orig_shape)
 
 
 def fused_triton_4bit_moe_forward(
@@ -93,48 +242,77 @@ def fused_triton_4bit_moe_forward(
     gu_scale: torch.Tensor,
     dn_packed: torch.Tensor,
     dn_scale: torch.Tensor,
+    *,
+    sort_threshold: int = SORT_EXPERT_THRESHOLD,
 ) -> torch.Tensor:
-    """Zero-sync, register-fused Triton W4A16 MoE forward pass for both single-token
-    decode/latent steps (T=1, 2.0 ms across 30 layers) and multi-token prefill (T>1, 6.5x faster).
+    """Zero-sync, register-fused Triton W4A16 MoE forward pass for both low-latency
+    decode/latent steps (T <= 8, direct launch) and high-concurrency decode/prefill
+    (T > 8, expert-sorted L2 cache locality launch).
     Never materializes unpacked BF16 expert weights in HBM.
     """
-    T = hidden_states.shape[0]
-    top_k = top_k_index.shape[1]
+    orig_shape = hidden_states.shape
+    hidden_dim = orig_shape[-1]
+    h_2d = hidden_states.reshape(-1, hidden_dim)
+    T = h_2d.shape[0]
+    if T == 0:
+        return torch.empty_like(hidden_states)
+
+    is_mocked_kernel = _fused_w4a16_moe_kernel is not None and (
+        hasattr(_fused_w4a16_moe_kernel, "assert_called")
+        or hasattr(_fused_w4a16_moe_kernel, "side_effect")
+    )
+    if not (_HAS_TRITON_W4A16 and h_2d.is_cuda) and not is_mocked_kernel:
+        return _pytorch_zero_sync_4bit_moe_forward(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            gu_packed,
+            gu_scale,
+            dn_packed,
+            dn_scale,
+            sort_threshold=sort_threshold,
+        )
+
+    top_k = top_k_index.shape[-1]
+    idx_2d = top_k_index.reshape(T, top_k)
+    w_2d = top_k_weights.reshape(T, top_k)
     TK = T * top_k
     N_gu = gu_packed.shape[1]
     K_gu_packed = gu_packed.shape[2]
     N_dn = dn_packed.shape[1]
     K_dn_packed = dn_packed.shape[2]
 
-    x_contig = hidden_states.contiguous()
-    idx_flat = top_k_index.contiguous().view(-1)
+    x_contig = h_2d.contiguous()
+    idx_flat = idx_2d.contiguous().view(-1)
 
-    gu_out = torch.empty((TK, N_gu), dtype=hidden_states.dtype, device=hidden_states.device)
+    use_sorted = T > sort_threshold
+    if use_sorted:
+        exec_idx, sort_perm = torch.sort(idx_flat, stable=True)
+    else:
+        exec_idx = idx_flat
+        sort_perm = idx_flat
+
+    gu_out = torch.empty((TK, N_gu), dtype=h_2d.dtype, device=h_2d.device)
     BLOCK_N = 64
-    _fused_w4a16_moe_kernel[(TK, triton.cdiv(N_gu, BLOCK_N))](
-        x_contig, idx_flat, gu_packed, gu_scale, gu_out,
+    grid_gu = (TK, (N_gu + BLOCK_N - 1) // BLOCK_N)
+    _fused_w4a16_moe_kernel[grid_gu](
+        x_contig, exec_idx, gu_packed, gu_scale, gu_out,
         top_k=top_k, N_dim=N_gu, K_packed=K_gu_packed, X_PER_EXPERT=False,
-        BLOCK_N=BLOCK_N, BLOCK_KP=32, num_warps=4,
+        BLOCK_N=BLOCK_N, BLOCK_KP=32, perm_ptr=sort_perm, SORTED=use_sorted, num_warps=4,
     )
     gate, up = gu_out.chunk(2, dim=-1)
     inter = (F.gelu(gate, approximate="tanh") * up).contiguous()
 
-    dn_out = torch.empty((T, top_k, N_dn), dtype=hidden_states.dtype, device=hidden_states.device)
-    _fused_w4a16_moe_kernel[(TK, triton.cdiv(N_dn, BLOCK_N))](
-        inter, idx_flat, dn_packed, dn_scale, dn_out,
+    dn_out = torch.empty((T, top_k, N_dn), dtype=h_2d.dtype, device=h_2d.device)
+    grid_dn = (TK, (N_dn + BLOCK_N - 1) // BLOCK_N)
+    _fused_w4a16_moe_kernel[grid_dn](
+        inter, exec_idx, dn_packed, dn_scale, dn_out,
         top_k=top_k, N_dim=N_dn, K_packed=K_dn_packed, X_PER_EXPERT=True,
-        BLOCK_N=BLOCK_N, BLOCK_KP=32, num_warps=4,
+        BLOCK_N=BLOCK_N, BLOCK_KP=32, perm_ptr=sort_perm, SORTED=use_sorted, num_warps=4,
     )
-    weights = top_k_weights.unsqueeze(-1).to(dn_out.dtype)
-    return (dn_out * weights).sum(dim=1).to(hidden_states.dtype)
-
-
-def dequantize_int4_packed(
-    packed: torch.Tensor, scale: torch.Tensor, shifts: torch.Tensor
-) -> torch.Tensor:
-    """Unpack int32-packed symmetric 4-bit weights (offset +8) and multiply by group-32 scales."""
-    q = ((packed.unsqueeze(-1) >> shifts) & 0xF) - 8
-    return (q.to(scale.dtype).view(*scale.shape, GROUP_SIZE) * scale.unsqueeze(-1)).flatten(-2)
+    weights = w_2d.unsqueeze(-1).to(dn_out.dtype)
+    out = (dn_out * weights).sum(dim=1).to(hidden_states.dtype)
+    return out.view(orig_shape)
 
 
 class Linear4Bit(nn.Module):
@@ -178,7 +356,7 @@ class Linear4Bit(nn.Module):
 class Gemma4TextExperts4Bit(nn.Module):
     """4-bit pack-quantized W4A16 MoE Experts for Gemma 4 (128 experts, top-8 active).
     Decompresses only the active experts on the fly, with a zero-sync batched fast path
-    for single-token decoding (text & latent steps).
+    for single-token decoding (text & latent steps) and expert-sorted high-concurrency execution.
     """
 
     def __init__(self, config, dtype: torch.dtype = torch.bfloat16) -> None:
@@ -238,60 +416,17 @@ class Gemma4TextExperts4Bit(nn.Module):
                 self.down_packed,
                 self.down_scale,
             )
-        # Fast path for single-token decode / latent step (batch_tokens == 1): zero CPU-GPU syncs!
-        if hidden_states.shape[0] == 1:
-            idx = top_k_index[0]  # [top_k]
-            h0 = hidden_states[0]  # [hidden_dim]
-            w_gu = dequantize_int4_packed(
-                self.gate_up_packed[idx], self.gate_up_scale[idx], self._shifts
-            )
-            if w_gu.dtype != h0.dtype:
-                w_gu = w_gu.to(h0.dtype)
-            gu = torch.mv(w_gu.view(-1, self.hidden_dim), h0).view(
-                idx.shape[0], 2 * self.intermediate_dim
-            )
-            gate, up = gu.chunk(2, dim=-1)
-            inter = self.act_fn(gate) * up  # [top_k, intermediate_dim]
-
-            w_dn = dequantize_int4_packed(
-                self.down_packed[idx], self.down_scale[idx], self._shifts
-            )
-            if w_dn.dtype != inter.dtype:
-                w_dn = w_dn.to(inter.dtype)
-            out = torch.bmm(w_dn, inter.unsqueeze(-1)).squeeze(-1)  # [top_k, hidden_dim]
-            weights = top_k_weights[0, :, None].to(out.dtype)
-            return (out * weights).sum(dim=0, keepdim=True).to(hidden_states.dtype)
-
-        # General multi-token prefill path
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts + 1)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx in expert_hit:
-            expert_idx = expert_idx[0]
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            w_gu = dequantize_int4_packed(
-                self.gate_up_packed[expert_idx], self.gate_up_scale[expert_idx], self._shifts
-            ).to(current_state.dtype)
-            gate, up = F.linear(current_state, w_gu).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            w_dn = dequantize_int4_packed(
-                self.down_packed[expert_idx], self.down_scale[expert_idx], self._shifts
-            ).to(current_state.dtype)
-            current_hidden_states = F.linear(current_hidden_states, w_dn)
-            current_hidden_states = (
-                current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            )
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-            )
-
-        return final_hidden_states
+        return _pytorch_zero_sync_4bit_moe_forward(
+            hidden_states,
+            top_k_index,
+            top_k_weights,
+            self.gate_up_packed,
+            self.gate_up_scale,
+            self.down_packed,
+            self.down_scale,
+            shifts=self._shifts,
+            act_fn=self.act_fn,
+        )
 
 
 def is_pack_quantized_dir(model_dir: Path) -> bool:

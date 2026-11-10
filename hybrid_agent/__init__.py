@@ -26,7 +26,16 @@ from .engine import (
     RowState,
 )
 from .hybridlink import HybridLink
-from .model import HybridAgentModel, add_anchor_tokens, load_hybrid_agent, resolve_model_dir
+from .model import (
+    DEFAULT_GEMMA4_PROCESSOR_REPO,
+    HybridAgentModel,
+    HybridMultimodalProcessor,
+    add_anchor_tokens,
+    ensure_chat_template,
+    load_hybrid_agent,
+    load_hybrid_processor,
+    resolve_model_dir,
+)
 from .prompts import SYSTEM_PROMPT
 from .readout import LatentSpanReadout, latent_readout, render_with_readout
 from .tools import ToolExecutor, build_tool_executor
@@ -34,11 +43,15 @@ from .tools import ToolExecutor, build_tool_executor
 __all__ = [
     "ANCHOR_TOKENS", "ENTRY_ANCHOR", "EXIT_ANCHOR", "SYSTEM_PROMPT",
     "DECODE", "LATENT", "FEED", "IDLE", "DONE",
+    "DEFAULT_GEMMA4_PROCESSOR_REPO",
     "HybridAgentModel", "HybridEngine", "HybridGenerationEngine", "HybridLink",
+    "HybridMultimodalProcessor",
     "HybridRound", "HybridTrajectory", "LatentSpanReadout", "RowState",
     "SGLangHybridEngine", "ToolExecutor", "add_anchor_tokens", "build_tool_executor",
-    "compile_hybridlink_tensorrt", "enable_tensorrt_acceleration", "extract_answer",
+    "compile_hybridlink_tensorrt", "enable_tensorrt_acceleration",
+    "ensure_chat_template", "extract_answer",
     "get_sglang_server_command", "latent_readout", "load_hybrid_agent",
+    "load_hybrid_processor",
     "patch_bf16_experts_fastpath", "prepare_sglang_model_dir", "render_with_readout",
     "resolve_model_dir", "special_token_id", "strip_latent_spans",
 ]

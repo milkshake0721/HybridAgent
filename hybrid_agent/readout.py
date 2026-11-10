@@ -12,12 +12,15 @@ import torch.nn.functional as F
 _BANK_CACHE: dict[tuple, torch.Tensor] = {}
 
 
-def normalized_embeddings(embed_weight: torch.Tensor) -> torch.Tensor:
-    """Unit-norm fp32 copy of the input-embedding table, built once per table."""
-    key = (embed_weight.data_ptr(), tuple(embed_weight.shape), str(embed_weight.device))
+def normalized_embeddings(
+    embed_weight: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Unit-norm bfloat16 copy of the input-embedding table (~1.47 GB instead of 2.95 GB), built once per table."""
+    key = (embed_weight.data_ptr(), tuple(embed_weight.shape), str(embed_weight.device), dtype)
     bank = _BANK_CACHE.get(key)
     if bank is None:
-        bank = F.normalize(embed_weight.detach().float(), dim=-1)
+        bank = F.normalize(embed_weight.detach().float(), dim=-1).to(dtype=dtype)
         _BANK_CACHE.clear()
         _BANK_CACHE[key] = bank
     return bank
@@ -25,8 +28,14 @@ def normalized_embeddings(embed_weight: torch.Tensor) -> torch.Tensor:
 
 def nearest_token_ids(latent_inputs: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
     """Nearest vocabulary token of each latent input [n, D] by cosine similarity."""
-    z = F.normalize(latent_inputs.detach().float(), dim=-1)
-    return (z @ bank.T).argmax(dim=-1)
+    orig_1d = latent_inputs.ndim == 1
+    if orig_1d:
+        latent_inputs = latent_inputs.unsqueeze(0)
+    if latent_inputs.numel() == 0:
+        return torch.empty((0,), dtype=torch.long, device=latent_inputs.device)
+    z = F.normalize(latent_inputs.detach().float(), dim=-1).to(dtype=bank.dtype)
+    out = (z @ bank.T).argmax(dim=-1)
+    return out.squeeze(0) if orig_1d else out
 
 
 def latent_readout(
@@ -34,11 +43,14 @@ def latent_readout(
 ) -> list[list[tuple[str, int, float]]]:
     """Top-k (token, id, cosine) per latent step for offline inspection."""
     bank = normalized_embeddings(embed_weight)
-    z = F.normalize(latent_inputs.detach().float(), dim=-1)
+    z = F.normalize(latent_inputs.detach().float(), dim=-1).to(dtype=bank.dtype)
     if z.ndim == 1:
         z = z.unsqueeze(0)
+    if z.numel() == 0:
+        return []
     sims = z @ bank.T
-    values, indices = torch.topk(sims, k=top_k, dim=-1)
+    k = min(int(top_k), int(sims.shape[-1]))
+    values, indices = torch.topk(sims.float(), k=k, dim=-1)
     out = []
     for vals, ids in zip(values.tolist(), indices.tolist()):
         out.append([(tokenizer.decode([i]), int(i), float(v)) for v, i in zip(vals, ids)])

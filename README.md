@@ -19,7 +19,7 @@
 
 **HybridAgent** is an LLM agent that dynamically navigates between latent reasoning and text-based interaction within a single generation process. A lightweight **HybridLink** maps last-layer hidden states back into the input-embedding space, so the agent can enter **latent mode** for fast, inspectable inner thinking and return to **text mode** for tool calls, final answers and external monitoring. The complete hybrid context of text, latent thoughts and tool observations is carried across turns through the agent's own **working memory**, and every latent thought can be rendered as readable pseudo-text.
 
-This repository contains the method: the hybrid generation engine with Python and search tools, the **HybridSFT** and **HybridRL** post-training stages, batch inference, the **Interpretable Latent Mode** inspector, and full support for **Gemma 4 Dense (`12B`) & MoE (`26B-A4B`)** models with TensorRT and Triton W4A16 acceleration.
+This repository contains the method: the hybrid generation engine with Python and search tools, the **HybridSFT** and **HybridRL** post-training stages, batch inference, the **Interpretable Latent Mode** inspector, and full support for **Gemma 4 Dense (`12B`) & MoE (`26B-A4B`)** models with **High-Concurrency Dynamic-Batch TensorRT**, **Zero-Sync BF16 / Expert-Sorted Triton W4A16 MoE**, **Multimodal Vision (`Gemma4ForConditionalGeneration`)**, and the **5-Benchmark HuggingFace Evaluation Suite on Google Cloud G4 GPU (`NVIDIA RTX PRO 6000 Blackwell`, 96 GB GDDR7 VRAM)**.
 
 ## ⚙️ Installation
 
@@ -36,12 +36,13 @@ cp .env.example .env   # TAVILY_API_KEY for the search tool
 
 | Directory | Contents |
 |---|---|
-| [`hybrid_agent/`](hybrid_agent/) | HybridLink, the model wrapper and loader, the hybrid generation engine (text/latent modes, working memory, concurrent tool calls), TensorRT/SGLang/W4A16 backends, and tools |
+| [`hybrid_agent/`](hybrid_agent/) | HybridLink, multimodal model wrapper and loader, multi-question batched hybrid generation engine (text/latent modes, working memory, concurrent tool calls, multi-token `FEED` prefill), dynamic-batch TensorRT/SGLang/W4A16 backends, and tools |
+| [`hybrid_agent/benchmarks/`](hybrid_agent/benchmarks/) | 5-Benchmark HuggingFace evaluation suite (`MMLU Pro`, `AIME 2026 No Tools`, `GPQA Diamond`, `LiveCodeBench v6`, `MMMU Pro`), G4 GPU concurrency auto-tuner, and sandbox graders |
 | [`hybrid_sft/`](hybrid_sft/) | HybridSFT: data format, objective and trainer |
 | [`hybrid_rl/`](hybrid_rl/) | HybridRL: hybrid policy rollout, reward, exact rollout replay, policy update |
-| [`hybrid_inference/`](hybrid_inference/) | Batch hybrid inference over a JSONL of questions |
+| [`hybrid_inference/`](hybrid_inference/) | High-concurrency batch hybrid inference over a JSONL of questions (`--backend tensorrt --question_batch_size 32`) |
 | [`interpretable_latent_mode/`](interpretable_latent_mode/) | Latent thoughts as pseudo-text: HTML reports and terminal view |
-| [`scripts/`](scripts/) | Launchers for the three stages |
+| [`scripts/`](scripts/) | Launchers for batch inference, SFT, and RL |
 
 ## 🤗 Released models and data
 
@@ -59,9 +60,9 @@ Checkpoints and data load from a local directory or directly from the Hugging Fa
 
 *Note:* Each model directory holds the backbone in Hugging Face format together with the HybridLink weights (`adapter.pt` / `hybridlink.pt`, `adapter_config.json` / `hybridlink_config.json`).
 
-## ⚡ Gemma 4 MoE (`26B-A4B`) — TensorRT & SGLang Acceleration Guide
+## ⚡ Gemma 4 MoE (`26B-A4B`) — High-Concurrency TensorRT & SGLang Acceleration Guide
 
-Because **HybridAgent** dynamically switches between **Text Mode (`DECODE`)** and **Latent Mode (`LATENT`: continuous hidden-state feedback $e_{t+1} = \mathcal{R}(h_t)$ via `HybridLink` scaled by Gemma 4's `embed_scale = \sqrt{2816}`)** over a shared persistent KV working memory, this repository provides dedicated **TensorRT (`torch_tensorrt`)** and **SGLang (`sglang`)** backends in [`hybrid_agent/backends.py`](hybrid_agent/backends.py) and [`sglang_tensorrt_runner.py`](sglang_tensorrt_runner.py).
+Because **HybridAgent** dynamically switches between **Text Mode (`DECODE`)** and **Latent Mode (`LATENT`: continuous hidden-state feedback $e_{t+1} = \mathcal{R}(h_t)$ via `HybridLink` scaled by Gemma 4's `embed_scale = \sqrt{2816}`)** over a shared persistent KV working memory, this repository provides dedicated **High-Concurrency TensorRT (`torch_tensorrt`)** and **SGLang (`sglang`)** backends in [`hybrid_agent/backends.py`](hybrid_agent/backends.py) and [`sglang_tensorrt_runner.py`](sglang_tensorrt_runner.py).
 
 ### 1. Install Acceleration Dependencies
 
@@ -69,40 +70,61 @@ Because **HybridAgent** dynamically switches between **Text Mode (`DECODE`)** an
 pip install torch-tensorrt==2.11.0 sglang==0.5.17
 ```
 
-### 2. Method A: TensorRT-Accelerated `HybridEngine` (`backend="tensorrt"`, Recommended)
+### 2. Method A: High-Concurrency TensorRT `HybridEngine` (`backend="tensorrt"`, Recommended)
 
-Compiles `HybridLink` (`adapter.pt` / `hybridlink.pt`) into a native **NVIDIA TensorRT Engine** (`torch_tensorrt.compile`), patches all 30 BF16 MoE layers (`Gemma4TextExperts`) with a **Zero-Sync Batched Fast Path** (eliminating CPU-GPU `.nonzero()` syncs per step), and fuses the 4-bit (`Gemma4TextExperts4Bit`) single-token W4A16 decode kernel via Triton/Inductor:
+Compiles `HybridLink` (`adapter.pt` / `hybridlink.pt`) into a **Dynamic-Batch NVIDIA TensorRT Engine** (`min_shape=(1, 2816)`, `opt_shape=(32, 2816)`, `max_shape=(256, 2816)` with automatic chunking for `N > max_batch_size`), patches all 30 BF16 MoE layers (`Gemma4TextExperts`) with a **Zero-Sync Micro-Batched Fast Path** (scaling to `B = 1..256+` with zero `.nonzero()` CPU-GPU syncs and compiled post-attention `patch_compiled_ffn_bf16`), and accelerates 4-bit (`Gemma4TextExperts4Bit`) high-concurrency batches (`T > 8`) via **Expert-Sorted L2-Locality Triton W4A16 Kernels**:
 
 ```bash
+# Run multiple questions concurrently with TensorRT backend
+python3 sglang_tensorrt_runner.py \
+    --backend tensorrt \
+    --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --batch-size 32 \
+    --questions \
+      "If 3x + 7 = 22, what is the value of 5x - 2?" \
+      "A rectangle has a perimeter of 30 cm and an area of 54 cm^2. What are the lengths of its sides?"
+
 # Run 4-bit W4A16 checkpoint (~19.0 GB VRAM) with TensorRT backend
 python3 sglang_tensorrt_runner.py \
     --backend tensorrt \
     --model milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit \
+    --batch-size 64 \
     --question "A rectangle has a perimeter of 30 cm and an area of 54 cm^2. What are the lengths of its sides?"
-
-# Run Full BF16 checkpoint (~54.7 GB VRAM) with TensorRT backend
-python3 sglang_tensorrt_runner.py \
-    --backend tensorrt \
-    --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
-    --question "If 3x + 7 = 22, what is the value of 5x - 2?"
 ```
 
-Or via the Python API:
+Or via the Python API (`HybridEngine.run_batch` with optional multimodal `images`):
 
 ```python
 import torch
 from hybrid_agent import HybridEngine, SYSTEM_PROMPT, load_hybrid_agent
 
 model, tokenizer = load_hybrid_agent(
-    "milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit",  # or "milkshake721/Gemma-4-26B-A4B-HybridAgent"
+    "milkshake721/Gemma-4-26B-A4B-HybridAgent",  # or "milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit"
     dtype=torch.bfloat16,
     device="cuda",
     backend="tensorrt",
+    max_batch_size=256,
+    load_processor=True,
 )
-engine = HybridEngine(model, tokenizer, max_new_tokens=1024, max_latent_steps=64, temperature=0.0)
-traj = engine.run("If 3x + 7 = 22, what is the value of 5x - 2?", system_prompt=SYSTEM_PROMPT)
-print("Final Answer:", traj.final_answer)
-print(traj.output_rendered)
+engine = HybridEngine(
+    model,
+    tokenizer,
+    processor=model.processor,
+    max_new_tokens=4096,
+    max_latent_steps=64,
+    temperature=0.0,
+    default_batch_size=32,
+)
+trajs = engine.run_batch(
+    [
+        "If 3x + 7 = 22, what is the value of 5x - 2?",
+        "What is the sum of all integers from 1 to 20 inclusive?",
+    ],
+    batch_size=32,
+    system_prompt=SYSTEM_PROMPT,
+)
+for traj in trajs:
+    print("Final Answer:", traj.final_answer)
 ```
 
 ### 3. Method B: SGLang Hybrid Engine & Server (`SGLangHybridEngine` / `sglang.launch_server`)
@@ -116,6 +138,7 @@ SGLang (`>=0.5.17`) natively supports both Gemma 4 MoE checkpoint layouts in `sg
 python3 sglang_tensorrt_runner.py \
     --backend sglang \
     --model milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit \
+    --batch-size 16 \
     --question "If 3x + 7 = 22, what is the value of 5x - 2?"
 
 # 2) Or launch a standalone SGLang OpenAI-compatible Server:
@@ -127,17 +150,47 @@ python3 -m sglang.launch_server \
     --port 30000 \
     --mem-fraction-static 0.80 \
     --trust-remote-code
-
-# For BF16 checkpoint:
-python3 -m sglang.launch_server \
-    --model-path /path/to/Gemma-4-26B-A4B-HybridAgent \
-    --dtype bfloat16 \
-    --port 30000 \
-    --mem-fraction-static 0.80 \
-    --trust-remote-code
 ```
 
-### 4. Benchmark Results (RTX PRO 6000 Blackwell)
+### 4. 🏆 5-Benchmark HuggingFace Evaluation Suite on Google Cloud G4 GPU (`eval_hf_benchmarks.py`)
+
+[`eval_hf_benchmarks.py`](eval_hf_benchmarks.py) and [`hybrid_agent/benchmarks/`](hybrid_agent/benchmarks/) provide a unified, high-concurrency TensorRT evaluation suite for [`milkshake721/Gemma-4-26B-A4B-HybridAgent`](https://huggingface.co/milkshake721/Gemma-4-26B-A4B-HybridAgent) on **Google Cloud G4 GPU** (`NVIDIA RTX PRO 6000 Blackwell Server Edition`, 96 GB GDDR7 VRAM) across all 5 official HuggingFace benchmarks:
+
+| Benchmark | Key | HuggingFace Dataset | Format & Grader | Tool Policy | Reference Target | Recommended G4 Concurrency (BF16 / 4-bit) |
+| :--- | :--- | :--- | :--- | :---: | :---: | :---: |
+| **MMLU Pro** | `mmlu_pro` | `TIGER-Lab/MMLU-Pro` (`test`) | 10-choice (`A`–`J`) exact match | Tools Allowed | **`82.6%`** | `B = 64` / `B = 128` |
+| **AIME 2026 (No Tools)** | `aime_2026` | `MathArena/aime_2026` | 3-digit integer (`000`–`999`) | **Strict No Tools (`max_tool_calls=0`)** | **`88.3%`** | `B = 32` / `B = 64` |
+| **GPQA Diamond** | `gpqa_diamond` | `Idavidrein/gpqa` / `fingertap/GPQA-Diamond` | Deterministic 4-choice (`A`–`D`) | Tools Allowed | **`82.3%`** | `B = 32` / `B = 64` |
+| **LiveCodeBench v6** | `livecodebench_v6` | `livecodebench/code_generation_lite` (`release_v6`) | Subprocess sandbox `pass@1` (`stdin` & `Solution`) | Tools Allowed | **`77.1%`** | `B = 32` / `B = 64` |
+| **MMMU Pro (多模態)** | `mmmu_pro` | `MMMU/MMMU_Pro` (`standard (10 options)` & `vision`) | Multimodal PIL image + 10-choice (`A`–`J`) | Tools Allowed | **`73.8%`** | `B = 32` / `B = 64` |
+
+```bash
+# Run all 5 HuggingFace benchmarks on G4 GPU with high-concurrency TensorRT
+python3 eval_hf_benchmarks.py \
+    --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --backend tensorrt \
+    --benchmarks all \
+    --batch-size 32 \
+    --output-dir outputs/benchmarks
+
+# Run specific benchmarks (e.g., AIME 2026 No Tools and MMLU Pro)
+python3 eval_hf_benchmarks.py \
+    --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --backend tensorrt \
+    --benchmarks mmlu_pro aime_2026 \
+    --batch-size 32 \
+    --output-dir outputs/benchmarks
+
+# Offline / CI synthetic smoke test across all 5 benchmarks
+python3 eval_hf_benchmarks.py \
+    --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --backend tensorrt \
+    --benchmarks all \
+    --synthetic-smoke \
+    --output-dir outputs/benchmarks_smoke
+```
+
+### 5. 10-Question Math/Logic Benchmark Results (RTX PRO 6000 Blackwell)
 
 See [`BENCHMARK_AND_OPTIMIZATION_NOTES.md`](BENCHMARK_AND_OPTIMIZATION_NOTES.md) for the kernel fusion architecture and per-question breakdown.
 
@@ -151,19 +204,28 @@ See [`BENCHMARK_AND_OPTIMIZATION_NOTES.md`](BENCHMARK_AND_OPTIMIZATION_NOTES.md)
 python3 test_gemma4_26b_hybrid.py milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit --backend tensorrt
 python3 test_gemma4_26b_hybrid.py milkshake721/Gemma-4-26B-A4B-HybridAgent --backend tensorrt
 
-# 10-question math/logic benchmark evaluation
+# 10-question math/logic benchmark evaluation (runs in batched TensorRT mode)
 python3 eval_gemma4_26b_hybrid.py milkshake721/Gemma-4-26B-A4B-HybridAgent-4bit eval_results_4bit.json tensorrt
 ```
 
 ## 🚀 Quick start
 
-### Batch Hybrid Inference
+### High-Concurrency Batch Hybrid Inference
 
 ```bash
+# Intra-GPU multi-question TensorRT batching (--backend tensorrt --question_batch_size 32)
 python -m hybrid_inference.run_batch --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --backend tensorrt --question_batch_size 32 \
     --input examples/questions.jsonl --output outputs/results.jsonl --num_samples 4
-bash scripts/run_batch_inference.sh 8 --model togethercomputer/HybridAgent-8B-Agentic \
-    --input questions.jsonl --output outputs/results.jsonl        # one process per GPU
+
+# Tool-free batch inference (e.g., for AIME 2026 No Tools)
+python -m hybrid_inference.run_batch --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --backend tensorrt --question_batch_size 32 --no_tools \
+    --input examples/questions.jsonl --output outputs/results_no_tools.jsonl
+
+# Multi-GPU sharded batch inference (defaults to --backend tensorrt --question_batch_size 32 per GPU)
+bash scripts/run_batch_inference.sh 8 --model milkshake721/Gemma-4-26B-A4B-HybridAgent \
+    --input questions.jsonl --output outputs/results.jsonl
 ```
 
 One record per question: the hybrid trajectory, the extracted answer, the pseudo-text readout of every latent span and the tool-call statistics. See [`hybrid_inference/`](hybrid_inference/).
